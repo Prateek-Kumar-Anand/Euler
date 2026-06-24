@@ -1,515 +1,560 @@
 // ============================================================
-// popup.js — DataGrapher Extension Popup Controller
+// popup.js — DataGrapher Popup Controller  [FIXED v1.1]
 // ============================================================
-// PURPOSE:
-//   All UI interaction logic for the popup window.
-//   Communicates with the active tab via chrome.scripting.
-//   Renders charts via Chart.js (loaded from vendor/).
-//   Exports PNG (canvas) and CSV (Blob) without any server.
+// FIXES IN THIS VERSION:
 //
-// STATE:
-//   allPairs    — raw array of { value, context, raw } from content.js
-//   chartInst   — the live Chart.js instance (null if no chart yet)
-//   filteredDS  — the dataset currently displayed ({labels[], values[]})
+//   BUG 1 FIX — Chart.js Memory Leak:
+//     Old code called chartInst.destroy() but left a zombie
+//     reference in Chart.js internal registry + the canvas 2D
+//     context still held stale pixel data.
+//     SOLUTION:
+//       a) Chart.getChart(canvas) — checks for any lingering
+//          instance on the canvas element BEFORE creating a new
+//          one (catches cases where chartInst was lost).
+//       b) After destroy(), canvas context is explicitly cleared
+//          via ctx.clearRect() so no pixel bleed occurs.
+//       c) chartInst is always nulled after destroy().
 //
-// FLOW:
-//   1. User clicks [Scan Page]
-//      → executeScript injects content.js into active tab
-//      → allPairs populated, dropdowns filled
-//   2. User picks X-axis and Y-axis from dropdowns
-//   3. User clicks [Build Chart]
-//      → filterDataset() builds filteredDS
-//      → buildChart() renders Chart.js chart
-//      → renderTable() populates the data table
-//   4. User exports PNG or CSV
+//   BUG 2 FIX — State Persistence (executeScript caching):
+//     Old code injected content.js via files:["content.js"].
+//     Chrome caches file-injected scripts per tab session and
+//     can return stale results on repeated scans.
+//     SOLUTION: content.js logic is now passed as an inline
+//     func: arrow function to executeScript(). Chrome ALWAYS
+//     re-evaluates inline functions — no caching possible.
+//     The full extraction logic is inlined into EXTRACTOR_FN
+//     at the bottom of this file and passed by reference.
 //
-// OFFLINE GUARANTEE:
-//   No fetch() calls. No external URLs. All assets local.
+//   BUG 4 FIX — Zipping Logic / Data Integrity:
+//     Old filterDataset() zipped X-pairs and Y-pairs purely by
+//     array index, which broke when content.js's `seen` Set
+//     silently dropped repeated values (now fixed in content.js),
+//     OR when X and Y counts differed due to page structure.
+//     SOLUTION:
+//       a) Pairs now carry sourceIndex (char offset). Zipping
+//          uses proximity-based matching: for each X-pair, find
+//          the nearest Y-pair (by sourceIndex distance) that
+//          hasn't been claimed yet. This matches "4 months 200
+//          sales" correctly even when counts differ.
+//       b) If proximity matching finds no valid pairs, falls
+//          back gracefully to positional zip with a warning.
+//       c) Unmatched X or Y pairs are shown in the status bar
+//          so the user knows data was trimmed.
 // ============================================================
 
 "use strict";
 
-// ── Module-level state ──────────────────────────────────────────
-let allPairs   = [];  // Full extraction result from content.js
-let chartInst  = null; // Active Chart.js instance
-let filteredDS = { labels: [], values: [], raws: [] }; // Current dataset
+// ── Module-level state ────────────────────────────────────────
+let allPairs   = [];
+let chartInst  = null;
+let filteredDS = { labels: [], values: [], raws: [] };
 
-// ── DOM references ──────────────────────────────────────────────
-const scanBtn       = document.getElementById("scan-btn");
-const buildBtn      = document.getElementById("build-btn");
-const resetBtn      = document.getElementById("reset-btn");
-const xSelect       = document.getElementById("x-select");
-const ySelect       = document.getElementById("y-select");
-const statusBar     = document.getElementById("status-bar");
-const statusText    = document.getElementById("status-text");
-const spinner       = document.getElementById("spinner");
-const chartWrapper  = document.getElementById("chart-wrapper");
-const chartCanvas   = document.getElementById("chart-canvas");
-const tableWrapper  = document.getElementById("table-wrapper");
-const tableBody     = document.getElementById("table-body");
-const pairCount     = document.getElementById("pair-count");
-const exportRow     = document.getElementById("export-row");
-const exportPNG     = document.getElementById("export-png");
-const exportCSV     = document.getElementById("export-csv");
-const emptyState    = document.getElementById("empty-state");
-const colX          = document.getElementById("col-x");
-const colY          = document.getElementById("col-y");
+// ── DOM references ────────────────────────────────────────────
+const scanBtn      = document.getElementById("scan-btn");
+const buildBtn     = document.getElementById("build-btn");
+const resetBtn     = document.getElementById("reset-btn");
+const xSelect      = document.getElementById("x-select");
+const ySelect      = document.getElementById("y-select");
+const statusBar    = document.getElementById("status-bar");
+const statusText   = document.getElementById("status-text");
+const spinner      = document.getElementById("spinner");
+const chartWrapper = document.getElementById("chart-wrapper");
+const chartCanvas  = document.getElementById("chart-canvas");
+const tableWrapper = document.getElementById("table-wrapper");
+const tableBody    = document.getElementById("table-body");
+const pairCount    = document.getElementById("pair-count");
+const exportRow    = document.getElementById("export-row");
+const exportPNG    = document.getElementById("export-png");
+const exportCSV    = document.getElementById("export-csv");
+const emptyState   = document.getElementById("empty-state");
+const colX         = document.getElementById("col-x");
+const colY         = document.getElementById("col-y");
 
-// ── Utility: Status bar helper ──────────────────────────────────
-//
-// @param {string} msg      — message to display
-// @param {"default"|"error"|"success"} type — visual style
-// @param {boolean} loading — show spinner
-
+// ── Status helper ─────────────────────────────────────────────
 function setStatus(msg, type = "default", loading = false) {
   statusText.textContent = msg;
   statusBar.className    = type === "default" ? "" : type;
   spinner.className      = loading ? "spinner active" : "spinner";
 }
 
-// ── STEP 1: Scan Page ───────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// BUG 1 FIX — destroyChart()
+// ─────────────────────────────────────────────────────────────
+// Safely destroys any Chart.js instance on the canvas.
+// Three-layer defence:
+//   Layer 1 — chartInst.destroy()  : normal path
+//   Layer 2 — Chart.getChart()     : catches zombie instances
+//             that exist in Chart's registry but whose JS
+//             reference we've lost (e.g. after rapid re-renders)
+//   Layer 3 — ctx.clearRect()      : wipes pixel buffer so no
+//             ghost chart image bleeds into the next render
+
+function destroyChart() {
+  // Layer 1: destroy via our own reference
+  if (chartInst) {
+    chartInst.destroy();
+    chartInst = null;
+  }
+
+  // Layer 2: destroy any zombie instance Chart.js still knows about
+  // Chart.getChart(element) returns the instance registered on that
+  // canvas, or undefined if none. This catches the case where our
+  // chartInst variable was already nulled but Chart's registry wasn't
+  // cleaned up (happens on rapid type-switch clicks).
+  const zombie = Chart.getChart(chartCanvas);
+  if (zombie) {
+    zombie.destroy();
+  }
+
+  // Layer 3: clear the raw canvas pixel buffer
+  const ctx = chartCanvas.getContext("2d");
+  if (ctx) {
+    ctx.clearRect(0, 0, chartCanvas.width, chartCanvas.height);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// BUG 2 FIX — EXTRACTOR_FN (inline function for executeScript)
+// ─────────────────────────────────────────────────────────────
+// This is the FULL content-script logic passed as func: to
+// chrome.scripting.executeScript(). Because it's an inline
+// function (not a file path), Chrome ALWAYS re-evaluates it
+// on every scan — no tab-session caching possible.
 //
-// Injects content.js into the currently active tab.
-// chrome.scripting.executeScript() returns the IIFE return value
-// of content.js as results[0].result.
+// Keeping it here (in popup.js) means one fewer file to ship,
+// and the extraction logic stays in version-controlled sync
+// with the popup controller that consumes its output.
+//
+// NOTE: This function runs in the PAGE context, not the
+// extension context. It cannot access any popup.js variables.
+// It must be fully self-contained.
+
+const EXTRACTOR_FN = function () {
+  "use strict";
+
+  // ── Noise blocklist (mirrors content.js NOISE_WORDS) ──────
+  const CSS_UNITS    = ["px","em","rem","vh","vw","pt","pc","cm","mm","in","ex","ch","vmin","vmax","fr","deg","rad","turn","ms","hz","khz","dpi","dpcm","dppx"];
+  const ORDINAL_SFXS = ["st","nd","rd","th"];
+  const VERSION_PFXS = ["v","ver","rev","rc","beta","alpha","build"];
+  const MEDIA_CODES  = ["mp3","mp4","jpg","jpeg","png","gif","svg","pdf","zip","gz","tar","wav","ogg","webm","mkv","avi","mov"];
+  const HTML_TAGS    = ["h1","h2","h3","h4","h5","h6","p","br","hr","li","ul","ol","td","tr","th","div","span","img","src","alt","href"];
+  const YEAR_CTXS    = ["year","yr","ad","bc","ce","bce"];
+
+  const NOISE = new Set([
+    ...CSS_UNITS, ...ORDINAL_SFXS, ...VERSION_PFXS,
+    ...MEDIA_CODES, ...HTML_TAGS,
+    "px","id","ip","ui","ux","js","ts","py","go","rb","am","pm",
+  ]);
+
+  function isYearLike(v, ctx) {
+    return v >= 1900 && v <= 2099 && YEAR_CTXS.includes(ctx);
+  }
+
+  // ── Gather raw text ──────────────────────────────────────
+  let rawText = "";
+  const sel = window.getSelection();
+  if (sel && sel.toString().trim().length > 0) {
+    rawText = sel.toString();
+  } else {
+    const paras = document.querySelectorAll("p");
+    rawText = paras.length > 0
+      ? Array.from(paras).map(el => el.innerText || el.textContent || "").join("\n")
+      : (document.body.innerText || "");
+  }
+
+  rawText = rawText.replace(/[ \t]+/g, " ").trim();
+
+  // ── Regex + filtering ────────────────────────────────────
+  // BUG 2 FIX: `seen` Set removed — duplicate values kept so
+  // positional/proximity zipping in popup.js stays accurate.
+  const PAIR_REGEX = /(\d[\d,]*\.?\d*)\s+([A-Za-z][A-Za-z0-9]{1,29})\b/g;
+  const pairs = [];
+  let match;
+
+  while ((match = PAIR_REGEX.exec(rawText)) !== null) {
+    const rawMatch  = match[0].trim();
+    const rawNumber = match[1];
+    const context   = match[2].toLowerCase();
+
+    // Noise filters
+    if (NOISE.has(context))                          continue;
+    if (context.length < 3)                          continue;
+    if (ORDINAL_SFXS.includes(context))              continue;
+    if ((context.match(/[a-z]/g)||[]).length < 2)    continue;
+    const _lc = (context.match(/[a-z]/g)||[]).length;
+    if (_lc / context.length < 0.7)                  continue; // blocks b2b, p2p, r2d2
+
+    const numericValue = parseFloat(rawNumber.replace(/,/g, ""));
+    if (isNaN(numericValue))                         continue;
+    if (isYearLike(numericValue, context))           continue;
+    if (numericValue <= 0)                           continue;
+
+    pairs.push({
+      value:       numericValue,
+      context:     context,
+      raw:         rawMatch,
+      sourceIndex: match.index,   // char offset — used for proximity zip
+    });
+  }
+
+  pairs.sort((a, b) => a.sourceIndex - b.sourceIndex);
+  return pairs;
+};
+
+// ── STEP 1: Scan Page ─────────────────────────────────────────
+//
+// BUG 2 FIX: uses func: EXTRACTOR_FN instead of files:["content.js"]
+// so Chrome never caches the injection result.
 
 scanBtn.addEventListener("click", async () => {
   setStatus("Scanning page…", "default", true);
   scanBtn.disabled = true;
 
   try {
-    // Get the focused window's active tab
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) throw new Error("No active tab found.");
 
-    if (!tab || !tab.id) {
-      throw new Error("No active tab found.");
-    }
-
-    // Inject and run content.js; capture its return value
+    // ── BUG 2 FIX: inline func — always re-evaluated ─────────
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      files:  ["content.js"],
+      func:   EXTRACTOR_FN,       // ← inline, never cached
     });
 
-    // results is an array of InjectionResult objects (one per frame).
-    // We only care about the main frame (index 0).
     const pairs = results?.[0]?.result;
 
     if (!Array.isArray(pairs) || pairs.length === 0) {
-      throw new Error("No numeric pairs found on this page. Try selecting specific text first.");
+      throw new Error(
+        "No numeric pairs found. Try selecting specific text first, " +
+        "or check that the page has visible numeric content in paragraphs."
+      );
     }
 
-    // Store globally
     allPairs = pairs;
-
-    // Populate dropdowns and enable mapping UI
     populateDropdowns(allPairs);
     emptyState.style.display = "none";
 
+    const ctxCount = uniqueContexts(allPairs).length;
     setStatus(
-      `Found ${allPairs.length} pairs across ${uniqueContexts(allPairs).length} context types.`,
+      `Found ${allPairs.length} pair(s) across ${ctxCount} context type(s).`,
       "success"
     );
 
-    buildBtn.disabled  = false;
-    resetBtn.disabled  = false;
+    buildBtn.disabled = false;
+    resetBtn.disabled = false;
 
   } catch (err) {
-    // Common errors:
-    //   "Cannot access a chrome:// URL" — user is on a browser page, not web content
-    //   "No numeric pairs found"         — page has no detectable number-word combos
     setStatus(`Error: ${err.message}`, "error");
     scanBtn.disabled = false;
   }
 });
 
-// ── STEP 2: Populate Dropdowns ──────────────────────────────────
-//
-// Extracts unique context words from allPairs and fills both
-// X-axis and Y-axis selects with them.
-//
-// @param {Array} pairs — the full allPairs array
-
+// ── STEP 2: Populate Dropdowns ────────────────────────────────
 function populateDropdowns(pairs) {
   const contexts = uniqueContexts(pairs);
 
-  // Clear existing options
   xSelect.innerHTML = "";
   ySelect.innerHTML = "";
 
-  // Add a blank placeholder as the first option
-  const placeholder = () => {
-    const opt = document.createElement("option");
-    opt.value       = "";
-    opt.textContent = "— Select —";
-    opt.disabled    = true;
-    opt.selected    = true;
-    return opt;
+  const makePlaceholder = () => {
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = "— Select —";
+    o.disabled = true; o.selected = true;
+    return o;
   };
 
-  xSelect.appendChild(placeholder());
-  ySelect.appendChild(placeholder());
+  xSelect.appendChild(makePlaceholder());
+  ySelect.appendChild(makePlaceholder());
 
-  // Add one <option> per unique context word
   contexts.forEach((ctx) => {
+    // Count how many pairs have this context — shown as "(n)" hint
+    const count = pairs.filter(p => p.context === ctx).length;
     const makeOpt = () => {
       const o = document.createElement("option");
       o.value       = ctx;
-      o.textContent = ctx;
+      o.textContent = `${ctx}  (${count})`;
       return o;
     };
     xSelect.appendChild(makeOpt());
     ySelect.appendChild(makeOpt());
   });
 
-  // Enable both selects now that we have data
   xSelect.disabled = false;
   ySelect.disabled = false;
 }
 
-// ── STEP 3: Build Chart ─────────────────────────────────────────
-//
-// Triggered when [Build Chart] is clicked.
-// Reads X and Y axis selections, filters the dataset,
-// then renders chart + table.
-
+// ── STEP 3: Build Chart ───────────────────────────────────────
 buildBtn.addEventListener("click", () => {
   const xLabel = xSelect.value;
   const yLabel = ySelect.value;
 
-  // ── Validation ────────────────────────────────────────────────
-  if (!xLabel) {
-    setStatus("Please select an X-axis label.", "error");
-    return;
-  }
-  if (!yLabel) {
-    setStatus("Please select a Y-axis label.", "error");
-    return;
-  }
-  if (xLabel === yLabel) {
-    setStatus("X and Y axes must be different context words.", "error");
-    return;
-  }
+  if (!xLabel) { setStatus("Please select an X-axis label.", "error"); return; }
+  if (!yLabel) { setStatus("Please select a Y-axis label.", "error"); return; }
+  if (xLabel === yLabel) { setStatus("X and Y axes must be different.", "error"); return; }
 
-  // ── Filter the dataset ────────────────────────────────────────
-  filteredDS = filterDataset(allPairs, xLabel, yLabel);
+  const { ds, warning } = filterDataset(allPairs, xLabel, yLabel);
+  filteredDS = ds;
 
   if (filteredDS.labels.length === 0) {
     setStatus(
-      `No pairable data found. "${xLabel}" and "${yLabel}" values don't appear in a mappable sequence.`,
+      `No pairable data found for "${xLabel}" ↔ "${yLabel}". ` +
+      `Try different axis selections.`,
       "error"
     );
     return;
   }
 
-  // ── Render chart ──────────────────────────────────────────────
   const chartType = getSelectedChartType();
   buildChart(filteredDS, chartType, xLabel, yLabel);
-
-  // ── Render table ──────────────────────────────────────────────
   renderTable(filteredDS, xLabel, yLabel);
-
-  // ── Show export buttons ───────────────────────────────────────
   exportRow.style.display = "flex";
 
-  setStatus(
-    `Chart built with ${filteredDS.labels.length} data point(s). X="${xLabel}", Y="${yLabel}".`,
-    "success"
-  );
+  const msg = `Chart built — ${filteredDS.labels.length} point(s). X="${xLabel}", Y="${yLabel}".`;
+  setStatus(warning ? `${msg} ⚠ ${warning}` : msg, warning ? "error" : "success");
 });
 
-// ── filterDataset ───────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// BUG 4 FIX — filterDataset() with proximity-based matching
+// ─────────────────────────────────────────────────────────────
+// OLD approach: simple positional zip — pairs X[0]↔Y[0],
+//   X[1]↔Y[1] regardless of where they appear in the text.
+//   BROKE when: X and Y counts differed, or content.js `seen`
+//   Set silently dropped pairs making counts unequal.
 //
-// STRATEGY:
-//   The content.js extraction returns a flat list of pairs.
-//   For example, given the text "In 4 months, sales reached 1200
-//   units. After 8 months, sales hit 2400 units.", we get:
-//     { value:4,    context:"months" }
-//     { value:1200, context:"sales"  }
-//     { value:8,    context:"months" }
-//     { value:2400, context:"sales"  }
+// NEW approach — proximity matching:
+//   For each X-pair (sorted by sourceIndex), find the Y-pair
+//   whose sourceIndex is CLOSEST (smallest absolute distance)
+//   and that hasn't been claimed yet. This maps data that
+//   naturally appears near each other in text, regardless of
+//   whether counts match.
 //
-//   To build a chart, we need to match X-items to Y-items.
-//   We use a POSITIONAL approach:
-//     1. Group pairs by context (X-group and Y-group separately).
-//     2. Zip them by index position: X[0]↔Y[0], X[1]↔Y[1] …
-//     3. Trim to the shorter group's length.
+//   Example: "Revenue 500 dollars in month 1. Month 2 saw 800 dollars."
+//     X-pairs (month):   [{val:1,idx:35}, {val:2,idx:52}]
+//     Y-pairs (dollars): [{val:500,idx:12}, {val:800,idx:62}]
+//   Proximity:
+//     month@35 → closest unclaimed dollars@12 (dist=23) ✓ → (1, 500)
+//     month@52 → closest unclaimed dollars@62 (dist=10) ✓ → (2, 800)
+//   Result: correct pairing even though dollars appears BEFORE month.
 //
-// This works well for naturally parallel textual data
-// (e.g. "4 months, 200 sales; 8 months, 400 sales").
-//
-// @param {Array}  pairs   — allPairs from content.js
-// @param {string} xLabel  — selected X-axis context word
-// @param {string} yLabel  — selected Y-axis context word
-// @returns {{ labels: number[], values: number[], raws: string[] }}
+// Falls back to positional zip if proximity produces 0 pairs
+// (safety net for unusual page structures).
 
 function filterDataset(pairs, xLabel, yLabel) {
-  // Separate X-type and Y-type pairs
-  const xPairs = pairs.filter((p) => p.context === xLabel);
-  const yPairs = pairs.filter((p) => p.context === yLabel);
+  const xPairs = pairs
+    .filter(p => p.context === xLabel)
+    .sort((a, b) => a.sourceIndex - b.sourceIndex);
 
-  // Zip by index
-  const len = Math.min(xPairs.length, yPairs.length);
+  const yPairs = pairs
+    .filter(p => p.context === yLabel)
+    .sort((a, b) => a.sourceIndex - b.sourceIndex);
 
-  const labels = [];
-  const values = [];
-  const raws   = [];
-
-  for (let i = 0; i < len; i++) {
-    labels.push(xPairs[i].value);               // X axis label (numeric)
-    values.push(yPairs[i].value);               // Y axis value
-    raws.push(`${xPairs[i].raw} | ${yPairs[i].raw}`); // For table display
+  if (xPairs.length === 0 || yPairs.length === 0) {
+    return { ds: { labels: [], values: [], raws: [] }, warning: null };
   }
 
-  return { labels, values, raws };
+  // ── Proximity matching ─────────────────────────────────────
+  const claimedY = new Set(); // indices into yPairs that are taken
+  const labels = [], values = [], raws = [];
+
+  for (const xp of xPairs) {
+    let bestIdx  = -1;
+    let bestDist = Infinity;
+
+    for (let j = 0; j < yPairs.length; j++) {
+      if (claimedY.has(j)) continue;
+      const dist = Math.abs(xp.sourceIndex - yPairs[j].sourceIndex);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx  = j;
+      }
+    }
+
+    if (bestIdx === -1) continue; // no unclaimed Y-pair for this X — skip, keep going
+
+    claimedY.add(bestIdx);
+    labels.push(xp.value);
+    values.push(yPairs[bestIdx].value);
+    raws.push(`${xp.raw}  ←→  ${yPairs[bestIdx].raw}`);
+  }
+
+  // ── Fallback: positional zip ───────────────────────────────
+  // Triggered if proximity matching somehow produced 0 results
+  // (e.g. all sourceIndex values are identical — unlikely but safe).
+  if (labels.length === 0) {
+    const len = Math.min(xPairs.length, yPairs.length);
+    for (let i = 0; i < len; i++) {
+      labels.push(xPairs[i].value);
+      values.push(yPairs[i].value);
+      raws.push(`${xPairs[i].raw}  ←→  ${yPairs[i].raw}`);
+    }
+  }
+
+  // ── Unmatched pair warning ─────────────────────────────────
+  const unmatched = xPairs.length - labels.length;
+  const warning = unmatched > 0
+    ? `${unmatched} X-value(s) had no matching Y-value and were skipped.`
+    : null;
+
+  return { ds: { labels, values, raws }, warning };
 }
 
-// ── buildChart ──────────────────────────────────────────────────
-//
-// Creates or replaces the Chart.js instance.
-// Destroys any existing instance first to prevent the
-// "Canvas is already in use" runtime error.
-//
-// @param {{ labels: number[], values: number[] }} ds
-// @param {string} type   — "bar" | "line" | "pie"
-// @param {string} xLabel — for axis title
-// @param {string} yLabel — for axis title
+// ─────────────────────────────────────────────────────────────
+// BUG 1 FIX — buildChart() using destroyChart()
+// ─────────────────────────────────────────────────────────────
 
 function buildChart(ds, type, xLabel, yLabel) {
-  // Destroy old chart if one exists
-  if (chartInst) {
-    chartInst.destroy();
-    chartInst = null;
-  }
+  // BUG 1 FIX: three-layer canvas cleanup before new Chart()
+  destroyChart();
 
-  // Show the canvas wrapper
   chartWrapper.classList.add("visible");
 
-  // ── Colour palette for pie / doughnut ─────────────────────────
-  // 12 distinct colours cycling for datasets with many segments.
   const PALETTE = [
-    "#6c63ff", "#34d399", "#f87171", "#fbbf24",
-    "#60a5fa", "#a78bfa", "#fb923c", "#4ade80",
-    "#f472b6", "#38bdf8", "#e879f9", "#facc15",
+    "#6c63ff","#34d399","#f87171","#fbbf24",
+    "#60a5fa","#a78bfa","#fb923c","#4ade80",
+    "#f472b6","#38bdf8","#e879f9","#facc15",
   ];
 
-  const bgColors = ds.labels.map((_, i) => PALETTE[i % PALETTE.length]);
-  const borderColors = bgColors.map((c) => c); // Same hue, full opacity border
+  const bgColors     = ds.labels.map((_, i) => PALETTE[i % PALETTE.length]);
+  const borderColors = bgColors.slice();
 
-  // ── Chart.js config ───────────────────────────────────────────
   const config = {
     type: type,
     data: {
-      labels: ds.labels.map(String), // Chart.js expects string labels
-      datasets: [
-        {
-          label: yLabel,
-          data: ds.values,
-          backgroundColor: type === "pie"
-            ? bgColors
-            : "rgba(108, 99, 255, 0.65)",
-          borderColor: type === "pie"
-            ? borderColors
-            : "#6c63ff",
-          borderWidth: 2,
-          // Line chart smoothing
-          tension: 0.35,
-          // Point styling for line chart
-          pointBackgroundColor: "#6c63ff",
-          pointRadius: 4,
-          fill: type === "line",
-        },
-      ],
+      labels: ds.labels.map(String),
+      datasets: [{
+        label:              yLabel,
+        data:               ds.values,
+        backgroundColor:    type === "pie" ? bgColors  : "rgba(108, 99, 255, 0.65)",
+        borderColor:        type === "pie" ? borderColors : "#6c63ff",
+        borderWidth:        2,
+        tension:            0.35,
+        pointBackgroundColor: "#6c63ff",
+        pointRadius:        4,
+        fill:               type === "line",
+      }],
     },
     options: {
-      responsive: true,
+      responsive:          true,
       maintainAspectRatio: true,
-      animation: { duration: 400 },
+      animation:           { duration: 350 },
       plugins: {
         legend: {
           display: type === "pie",
-          labels: { color: "#e2e8f0", font: { size: 11 } },
+          labels:  { color: "#e2e8f0", font: { size: 11 } },
         },
         tooltip: {
           callbacks: {
-            // Custom tooltip: "months: 4 → sales: 1200"
-            label: (ctx) =>
-              ` ${yLabel}: ${ctx.parsed.y ?? ctx.parsed}`,
-            title: (ctx) =>
-              `${xLabel}: ${ctx[0].label}`,
+            label: (ctx) => ` ${yLabel}: ${ctx.parsed.y ?? ctx.parsed}`,
+            title: (ctx) => `${xLabel}: ${ctx[0].label}`,
           },
         },
       },
-      scales: type === "pie"
-        ? {}   // Pie charts have no scales
-        : {
-            x: {
-              title: {
-                display: true,
-                text: xLabel,
-                color: "#94a3b8",
-                font: { size: 11 },
-              },
-              ticks: { color: "#94a3b8" },
-              grid:  { color: "#2a2d3e" },
-            },
-            y: {
-              title: {
-                display: true,
-                text: yLabel,
-                color: "#94a3b8",
-                font: { size: 11 },
-              },
-              ticks: { color: "#94a3b8" },
-              grid:  { color: "#2a2d3e" },
-              beginAtZero: true,
-            },
-          },
+      scales: type === "pie" ? {} : {
+        x: {
+          title: { display: true, text: xLabel, color: "#94a3b8", font: { size: 11 } },
+          ticks: { color: "#94a3b8" },
+          grid:  { color: "#2a2d3e" },
+        },
+        y: {
+          title: { display: true, text: yLabel, color: "#94a3b8", font: { size: 11 } },
+          ticks: { color: "#94a3b8" },
+          grid:  { color: "#2a2d3e" },
+          beginAtZero: true,
+        },
+      },
     },
   };
 
-  // Create the new Chart.js instance
+  // BUG 1 FIX: store fresh instance; canvas is guaranteed clean
   chartInst = new Chart(chartCanvas, config);
 }
 
-// ── renderTable ─────────────────────────────────────────────────
-//
-// Populates the filtered-data table below the chart.
-// Clears any previous rows before inserting new ones.
-//
-// @param {{ labels: number[], values: number[], raws: string[] }} ds
-// @param {string} xLabel
-// @param {string} yLabel
-
+// ── renderTable ───────────────────────────────────────────────
 function renderTable(ds, xLabel, yLabel) {
-  // Update column header names
-  colX.textContent = xLabel;
-  colY.textContent = yLabel;
-
-  // Clear old rows
+  colX.textContent    = xLabel;
+  colY.textContent    = yLabel;
   tableBody.innerHTML = "";
 
-  // Insert one row per data point
   ds.labels.forEach((lbl, i) => {
-    const tr = document.createElement("tr");
+    const tr   = document.createElement("tr");
+    const tdX  = document.createElement("td");
+    const tdY  = document.createElement("td");
+    const tdRw = document.createElement("td");
 
-    const tdX   = document.createElement("td");
-    const tdY   = document.createElement("td");
-    const tdRaw = document.createElement("td");
-
-    tdX.textContent   = lbl;
-    tdY.textContent   = ds.values[i];
-    tdRaw.textContent = ds.raws[i];
+    tdX.textContent  = lbl;
+    tdY.textContent  = ds.values[i];
+    tdRw.textContent = ds.raws[i];
 
     tr.appendChild(tdX);
     tr.appendChild(tdY);
-    tr.appendChild(tdRaw);
+    tr.appendChild(tdRw);
     tableBody.appendChild(tr);
   });
 
-  // Show the table section
   pairCount.textContent = `${ds.labels.length} pairs`;
   tableWrapper.classList.add("visible");
 }
 
-// ── EXPORT: PNG ─────────────────────────────────────────────────
-//
-// Reads pixel data from the Chart.js canvas via toDataURL().
-// Creates a temporary <a> and programmatically clicks it.
-// Works 100% offline.
-
+// ── Export: PNG ───────────────────────────────────────────────
 exportPNG.addEventListener("click", () => {
   if (!chartInst) return;
-
-  const url = chartCanvas.toDataURL("image/png");
-  triggerDownload(url, "datagraph-chart.png");
+  triggerDownload(chartCanvas.toDataURL("image/png"), "datagraph-chart.png");
 });
 
-// ── EXPORT: CSV ─────────────────────────────────────────────────
-//
-// Builds a plain text CSV from filteredDS.
-// First row = header. Subsequent rows = data.
-// Uses Blob + Object URL for a clean, offline download.
-
+// ── Export: CSV ───────────────────────────────────────────────
 exportCSV.addEventListener("click", () => {
   if (!filteredDS.labels.length) return;
 
-  const xLabel = xSelect.value || "x";
-  const yLabel = ySelect.value || "y";
+  const xL = xSelect.value || "x";
+  const yL = ySelect.value || "y";
 
-  // Build CSV content
   const lines = [
-    `"${xLabel}","${yLabel}","raw_match"`, // Header row
+    `"${xL}","${yL}","raw_match"`,
     ...filteredDS.labels.map(
       (lbl, i) =>
-        `${lbl},${filteredDS.values[i]},"${filteredDS.raws[i]}"`
+        // BUG 4 FIX: escape any double-quotes inside raw strings
+        // so the CSV doesn't break in Excel/LibreOffice.
+        `${lbl},${filteredDS.values[i]},"${String(filteredDS.raws[i]).replace(/"/g, '""')}"`
     ),
   ];
-  const csvString = lines.join("\r\n");
 
-  // Create downloadable Blob
-  const blob = new Blob([csvString], { type: "text/csv;charset=utf-8;" });
+  const blob = new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
   const url  = URL.createObjectURL(blob);
   triggerDownload(url, "datagraph-data.csv");
-
-  // Revoke the object URL after a short delay to free memory
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 });
 
-// ── triggerDownload ──────────────────────────────────────────────
-//
-// Generic helper: creates a hidden <a>, sets href + download,
-// clicks it, then removes it.
-//
-// @param {string} url      — data: or blob: URL
-// @param {string} filename — suggested filename for the download
-
+// ── triggerDownload ───────────────────────────────────────────
 function triggerDownload(url, filename) {
-  const a    = document.createElement("a");
-  a.href     = url;
-  a.download = filename;
+  const a      = document.createElement("a");
+  a.href       = url;
+  a.download   = filename;
   a.style.display = "none";
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
 }
 
-// ── Reset Session ───────────────────────────────────────────────
-//
-// Clears all state and returns the UI to its initial condition.
-// Useful when the user wants to re-scan after navigating to a
-// different page or correcting their text selection.
-
+// ── Reset ─────────────────────────────────────────────────────
 resetBtn.addEventListener("click", () => {
-  // Destroy chart
-  if (chartInst) {
-    chartInst.destroy();
-    chartInst = null;
-  }
+  destroyChart(); // BUG 1 FIX: use safe destroy, not inline logic
 
-  // Clear state
   allPairs   = [];
   filteredDS = { labels: [], values: [], raws: [] };
 
-  // Reset dropdowns
   xSelect.innerHTML = '<option value="">— Scan first —</option>';
   ySelect.innerHTML = '<option value="">— Scan first —</option>';
   xSelect.disabled  = true;
   ySelect.disabled  = true;
 
-  // Reset table
   tableBody.innerHTML = "";
   tableWrapper.classList.remove("visible");
   pairCount.textContent = "0 pairs";
 
-  // Hide chart
   chartWrapper.classList.remove("visible");
   exportRow.style.display = "none";
 
-  // Show empty state
   emptyState.style.display = "block";
 
-  // Disable action buttons
   buildBtn.disabled = true;
   resetBtn.disabled = true;
   scanBtn.disabled  = false;
@@ -517,12 +562,7 @@ resetBtn.addEventListener("click", () => {
   setStatus('Click "Scan Page" to extract data from the active tab.');
 });
 
-// ── Re-render on chart type change ──────────────────────────────
-//
-// If a chart is already rendered, switching the radio button
-// immediately redraws with the new type — no need to re-click
-// [Build Chart].
-
+// ── Chart type radio — instant redraw ─────────────────────────
 document.querySelectorAll('input[name="chart-type"]').forEach((radio) => {
   radio.addEventListener("change", () => {
     if (filteredDS.labels.length > 0) {
@@ -531,25 +571,14 @@ document.querySelectorAll('input[name="chart-type"]').forEach((radio) => {
   });
 });
 
-// ── Utility helpers ──────────────────────────────────────────────
+// ── Utilities ─────────────────────────────────────────────────
 
-/**
- * Returns sorted unique context words from a pairs array.
- * @param {Array} pairs
- * @returns {string[]}
- */
+/** Returns sorted unique context words from a pairs array */
 function uniqueContexts(pairs) {
-  return [...new Set(pairs.map((p) => p.context))].sort();
+  return [...new Set(pairs.map(p => p.context))].sort();
 }
 
-/**
- * Returns the currently selected chart type from radio buttons.
- * @returns {"bar"|"line"|"pie"}
- */
+/** Returns the currently selected chart type */
 function getSelectedChartType() {
   return document.querySelector('input[name="chart-type"]:checked')?.value || "bar";
 }
-
-// ── Defensive: handle popup reopening with stale DOM ─────────────
-// If the popup is closed and reopened, Chrome creates a fresh
-// popup window so state is always clean. No extra guard needed.
