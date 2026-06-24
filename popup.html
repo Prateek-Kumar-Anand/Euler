@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<!--
+  popup.html — DataGrapher Extension Popup
+  =========================================
+  PURPOSE:
+    The full UI shell for the extension. Loaded when the user
+    clicks the toolbar icon. Stays alive only while the popup
+    window is open (MV3 behaviour).
+
+  OFFLINE SAFETY:
+    Chart.js is loaded from vendor/chart.min.js (bundled locally).
+    No network requests are made at any point.
+
+  STRUCTURE:
+    ┌──────────────────────────────────┐
+    │  Header + Scan button            │  ← #scan-btn
+    ├──────────────────────────────────┤
+    │  Axis mapping dropdowns          │  ← #x-select, #y-select
+    │  Chart type selector             │  ← radio inputs
+    ├──────────────────────────────────┤
+    │  Chart canvas                    │  ← #chart-canvas
+    ├──────────────────────────────────┤
+    │  Pair table (filtered data)      │  ← #data-table
+    ├──────────────────────────────────┤
+    │  Export PNG / Export CSV buttons │  ← #export-png, #export-csv
+    └──────────────────────────────────┘
+
+  All interaction logic lives in popup.js.
+-->
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DataGrapher</title>
+
+  <!--
+    BUNDLED Chart.js — download from https://www.chartjs.org/
+    and place at vendor/chart.min.js before packaging.
+    File size: ~200 KB (UMD build, no CDN needed).
+  -->
+  <script src="vendor/chart.min.js"></script>
+
+  <style>
+    /* ── Reset & base ────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      /* ── Design tokens ─────────────────────────────────────── */
+      --bg:          #0f1117;   /* near-black canvas background  */
+      --surface:     #1a1d27;   /* card / panel background       */
+      --border:      #2a2d3e;   /* subtle separator lines        */
+      --accent:      #6c63ff;   /* primary purple accent         */
+      --accent-glow: rgba(108, 99, 255, 0.25);
+      --success:     #34d399;   /* export / success green        */
+      --danger:      #f87171;   /* error / warning red           */
+      --text-pri:    #e2e8f0;   /* primary text                  */
+      --text-sec:    #94a3b8;   /* secondary / muted text        */
+      --text-dim:    #475569;   /* very muted labels             */
+      --radius:      8px;
+      --font-mono:   'Fira Code', 'Consolas', monospace;
+      --font-sans:   'Inter', system-ui, -apple-system, sans-serif;
+    }
+
+    body {
+      width: 520px;
+      min-height: 200px;
+      max-height: 700px;
+      overflow-y: auto;
+      background: var(--bg);
+      color: var(--text-pri);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      padding: 0 0 16px;
+    }
+
+    /* Scrollbar styling */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      background: var(--bg);
+      z-index: 10;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      color: var(--text-pri);
+    }
+
+    .logo-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 8px var(--accent);
+    }
+
+    /* ── Buttons ─────────────────────────────────────────────── */
+    .btn {
+      padding: 7px 14px;
+      border: none;
+      border-radius: var(--radius);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s;
+      line-height: 1;
+    }
+    .btn:hover  { opacity: 0.85; }
+    .btn:active { transform: scale(0.97); }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+    .btn-success {
+      background: var(--success);
+      color: #0f2417;
+    }
+    .btn-ghost {
+      background: var(--surface);
+      color: var(--text-sec);
+      border: 1px solid var(--border);
+    }
+    .btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+
+    /* ── Sections / cards ────────────────────────────────────── */
+    .section {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .section-label {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+
+    /* ── Status / feedback bar ───────────────────────────────── */
+    #status-bar {
+      font-size: 12px;
+      color: var(--text-sec);
+      padding: 8px 16px;
+      min-height: 32px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #status-bar.error   { color: var(--danger); }
+    #status-bar.success { color: var(--success); }
+
+    .spinner {
+      width: 12px;
+      height: 12px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      display: none;
+    }
+    .spinner.active { display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Axis mapping row ────────────────────────────────────── */
+    .axis-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .axis-group label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-dim);
+      margin-bottom: 5px;
+      letter-spacing: 0.4px;
+    }
+
+    select {
+      width: 100%;
+      padding: 7px 10px;
+      background: var(--surface);
+      color: var(--text-pri);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 12px;
+      cursor: pointer;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      padding-right: 28px;
+      transition: border-color 0.15s;
+    }
+    select:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+    select:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Chart type radio pills ──────────────────────────────── */
+    .chart-type-group {
+      display: flex;
+      gap: 8px;
+    }
+    .chart-type-group label {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 12px;
+      cursor: pointer;
+      color: var(--text-sec);
+      transition: all 0.15s;
+      user-select: none;
+    }
+    .chart-type-group input[type="radio"] { display: none; }
+    .chart-type-group input[type="radio"]:checked + span {
+      /* highlight is set on the label, not the inner span */
+    }
+    .chart-type-group label:has(input:checked) {
+      border-color: var(--accent);
+      background: var(--accent-glow);
+      color: var(--text-pri);
+    }
+
+    /* ── Build / action row ──────────────────────────────────── */
+    .action-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .action-row .btn { flex: 1; }
+
+    /* ── Chart canvas wrapper ────────────────────────────────── */
+    #chart-wrapper {
+      display: none;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    #chart-wrapper.visible { display: block; }
+
+    #chart-canvas {
+      width: 100% !important;
+      max-height: 260px;
+      background: var(--surface);
+      border-radius: var(--radius);
+    }
+
+    /* ── Data table ──────────────────────────────────────────── */
+    #table-wrapper {
+      display: none;
+      padding: 0 16px 0;
+    }
+    #table-wrapper.visible { display: block; }
+
+    .table-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 0 8px;
+    }
+    .pair-count {
+      font-size: 11px;
+      color: var(--text-sec);
+      font-family: var(--font-mono);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    thead th {
+      text-align: left;
+      padding: 6px 10px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--border);
+    }
+    tbody tr:hover { background: var(--surface); }
+    tbody td {
+      padding: 5px 10px;
+      color: var(--text-sec);
+      border-bottom: 1px solid var(--border);
+      font-family: var(--font-mono);
+    }
+    tbody td:first-child { color: var(--accent); }
+
+    /* Export button row */
+    .export-row {
+      display: flex;
+      gap: 8px;
+      padding: 12px 16px 4px;
+    }
+    .export-row .btn { flex: 1; font-size: 11px; }
+
+    /* ── Empty / help state ──────────────────────────────────── */
+    .empty-state {
+      padding: 28px 16px;
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+    .empty-icon { font-size: 28px; display: block; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+
+  <!-- ── Header ─────────────────────────────────────────────── -->
+  <header>
+    <div class="logo">
+      <div class="logo-dot"></div>
+      DataGrapher
+    </div>
+    <!--
+      #scan-btn: Triggers content.js injection via popup.js.
+      Disabled until Chrome tab context is confirmed.
+    -->
+    <button id="scan-btn" class="btn btn-primary">⚡ Scan Page</button>
+  </header>
+
+  <!-- ── Status feedback ───────────────────────────────────── -->
+  <div id="status-bar">
+    <div class="spinner" id="spinner"></div>
+    <span id="status-text">Click "Scan Page" to extract data from the active tab.</span>
+  </div>
+
+  <!-- ── Axis Mapping Section ──────────────────────────────── -->
+  <div class="section" id="mapping-section">
+    <div class="section-label">Map Axes</div>
+    <div class="axis-row">
+      <div class="axis-group">
+        <!--
+          #x-select: Dropdown populated with unique context words.
+          The user selects which label acts as the X-axis (categories).
+        -->
+        <label for="x-select">X-Axis (category)</label>
+        <select id="x-select" disabled>
+          <option value="">— Scan first —</option>
+        </select>
+      </div>
+      <div class="axis-group">
+        <!--
+          #y-select: Same context words, but chosen as Y-axis (values).
+          The extension matches X-row items to Y-row items positionally.
+        -->
+        <label for="y-select">Y-Axis (value)</label>
+        <select id="y-select" disabled>
+          <option value="">— Scan first —</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Chart Type Section ────────────────────────────────── -->
+  <div class="section" id="chart-type-section">
+    <div class="section-label">Chart Type</div>
+    <div class="chart-type-group">
+      <!-- Each radio group shares the name "chart-type" -->
+      <label>
+        <input type="radio" name="chart-type" value="bar" checked />
+        <span>📊 Bar</span>
+      </label>
+      <label>
+        <input type="radio" name="chart-type" value="line" />
+        <span>📈 Line</span>
+      </label>
+      <label>
+        <input type="radio" name="chart-type" value="pie" />
+        <span>🥧 Pie</span>
+      </label>
+    </div>
+  </div>
+
+  <!-- ── Build Chart Action ────────────────────────────────── -->
+  <div class="section">
+    <div class="action-row">
+      <!--
+        #build-btn: Reads selected axes, filters allPairs,
+        calls buildChart() in popup.js.
+      -->
+      <button id="build-btn" class="btn btn-primary" disabled>
+        Build Chart
+      </button>
+      <!--
+        #reset-btn: Clears the current session (chart + table),
+        re-enables scan for a fresh run.
+      -->
+      <button id="reset-btn" class="btn btn-ghost" disabled>
+        Reset
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Chart Output ──────────────────────────────────────── -->
+  <div id="chart-wrapper">
+    <!--
+      Chart.js renders into this <canvas>.
+      The JS wrapper keeps a reference so it can be destroyed
+      before re-drawing to avoid the "Canvas is already in use"
+      Chart.js error.
+    -->
+    <canvas id="chart-canvas"></canvas>
+  </div>
+
+  <!-- ── Export Buttons (shown after chart renders) ────────── -->
+  <div class="export-row" id="export-row" style="display:none;">
+    <!--
+      #export-png: Calls canvas.toDataURL() and triggers download.
+      Works offline; no server involved.
+    -->
+    <button id="export-png" class="btn btn-ghost">⬇ PNG</button>
+    <!--
+      #export-csv: Builds a CSV string from the filtered dataset
+      and triggers a Blob download.
+    -->
+    <button id="export-csv" class="btn btn-success">⬇ CSV</button>
+  </div>
+
+  <!-- ── Filtered Data Table ───────────────────────────────── -->
+  <div id="table-wrapper">
+    <div class="table-header">
+      <div class="section-label" style="margin:0">Filtered Dataset</div>
+      <span class="pair-count" id="pair-count">0 pairs</span>
+    </div>
+    <!--
+      Populated dynamically by popup.js renderTable().
+      thead columns are renamed to match the user-selected axis labels.
+    -->
+    <table id="data-table">
+      <thead>
+        <tr>
+          <th id="col-x">X</th>
+          <th id="col-y">Y (value)</th>
+          <th>Raw match</th>
+        </tr>
+      </thead>
+      <tbody id="table-body">
+        <!-- Rows injected by JS -->
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── Initial empty state (hidden after scan) ───────────── -->
+  <div class="empty-state" id="empty-state">
+    <span class="empty-icon">🔍</span>
+    Navigate to a page with numeric data,<br>
+    then click <strong>Scan Page</strong>.
+  </div>
+
+  <!-- popup.js handles all interactivity -->
+  <script src="popup.js"></script>
+</body>
+</html>
