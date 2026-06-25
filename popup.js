@@ -1,45 +1,38 @@
 // ============================================================
-// popup.js — DataGrapher Popup Controller  [FIXED v1.1]
+// popup.js — DataGrapher Popup Controller  [FIXED v1.2]
 // ============================================================
-// FIXES IN THIS VERSION:
+// NEW FIXES IN THIS VERSION:
 //
-//   BUG 1 FIX — Chart.js Memory Leak:
-//     Old code called chartInst.destroy() but left a zombie
-//     reference in Chart.js internal registry + the canvas 2D
-//     context still held stale pixel data.
-//     SOLUTION:
-//       a) Chart.getChart(canvas) — checks for any lingering
-//          instance on the canvas element BEFORE creating a new
-//          one (catches cases where chartInst was lost).
-//       b) After destroy(), canvas context is explicitly cleared
-//          via ctx.clearRect() so no pixel bleed occurs.
-//       c) chartInst is always nulled after destroy().
+//   BUG A FIX — <p> Tag Limitation:
+//     EXTRACTOR_FN updated with priority-tiered DOM scraping:
+//     article → main → p/li/td/th/h1-h6/blockquote → body.
+//     isVisible() guard strips hidden/offscreen elements.
+//     sentenceIndex attached to every pair for Bug D.
 //
-//   BUG 2 FIX — State Persistence (executeScript caching):
-//     Old code injected content.js via files:["content.js"].
-//     Chrome caches file-injected scripts per tab session and
-//     can return stale results on repeated scans.
-//     SOLUTION: content.js logic is now passed as an inline
-//     func: arrow function to executeScript(). Chrome ALWAYS
-//     re-evaluates inline functions — no caching possible.
-//     The full extraction logic is inlined into EXTRACTOR_FN
-//     at the bottom of this file and passed by reference.
+//   BUG B FIX — Export PNG Animation Timing:
+//     Chart.js animation duration set to 0 (no animation in a
+//     520px popup — instant render, no timing race possible).
+//     exportPNG wraps toDataURL() in requestAnimationFrame so
+//     the browser has guaranteed one full paint cycle before
+//     the canvas pixel buffer is read. This prevents capturing
+//     a mid-paint or blank frame under any GPU/CPU load.
 //
-//   BUG 4 FIX — Zipping Logic / Data Integrity:
-//     Old filterDataset() zipped X-pairs and Y-pairs purely by
-//     array index, which broke when content.js's `seen` Set
-//     silently dropped repeated values (now fixed in content.js),
-//     OR when X and Y counts differed due to page structure.
-//     SOLUTION:
-//       a) Pairs now carry sourceIndex (char offset). Zipping
-//          uses proximity-based matching: for each X-pair, find
-//          the nearest Y-pair (by sourceIndex distance) that
-//          hasn't been claimed yet. This matches "4 months 200
-//          sales" correctly even when counts differ.
-//       b) If proximity matching finds no valid pairs, falls
-//          back gracefully to positional zip with a warning.
-//       c) Unmatched X or Y pairs are shown in the status bar
-//          so the user knows data was trimmed.
+//   BUG C FIX — Popup Closing / State Loss:
+//     chrome.storage.session persists allPairs, filteredDS,
+//     axis selections, and chart type across popup close/reopen.
+//     On DOMContentLoaded the popup checks for saved state and
+//     silently restores dropdowns + chart + table so the user
+//     never loses their work. Reset clears storage too.
+//     Requires "storage" in manifest.json permissions.
+//
+//   BUG D FIX — Incorrect Data Matching:
+//     filterDataset() now does sentence-aware two-pass matching:
+//       Pass 1: for each X-pair, search only Y-pairs that share
+//               the same sentenceIndex. Pick the nearest one.
+//       Pass 2: any X-pair without a sentence match falls back
+//               to global proximity across remaining Y-pairs.
+//     This prevents cross-sentence pairing where a Y from one
+//     paragraph incorrectly binds to an X from a different one.
 // ============================================================
 
 "use strict";
@@ -77,72 +70,35 @@ function setStatus(msg, type = "default", loading = false) {
   spinner.className      = loading ? "spinner active" : "spinner";
 }
 
-// ─────────────────────────────────────────────────────────────
-// BUG 1 FIX — destroyChart()
-// ─────────────────────────────────────────────────────────────
-// Safely destroys any Chart.js instance on the canvas.
-// Three-layer defence:
-//   Layer 1 — chartInst.destroy()  : normal path
-//   Layer 2 — Chart.getChart()     : catches zombie instances
-//             that exist in Chart's registry but whose JS
-//             reference we've lost (e.g. after rapid re-renders)
-//   Layer 3 — ctx.clearRect()      : wipes pixel buffer so no
-//             ghost chart image bleeds into the next render
-
+// ── destroyChart() — three-layer safe canvas cleanup ─────────
 function destroyChart() {
-  // Layer 1: destroy via our own reference
-  if (chartInst) {
-    chartInst.destroy();
-    chartInst = null;
-  }
-
-  // Layer 2: destroy any zombie instance Chart.js still knows about
-  // Chart.getChart(element) returns the instance registered on that
-  // canvas, or undefined if none. This catches the case where our
-  // chartInst variable was already nulled but Chart's registry wasn't
-  // cleaned up (happens on rapid type-switch clicks).
+  if (chartInst) { chartInst.destroy(); chartInst = null; }
   const zombie = Chart.getChart(chartCanvas);
-  if (zombie) {
-    zombie.destroy();
-  }
-
-  // Layer 3: clear the raw canvas pixel buffer
+  if (zombie) zombie.destroy();
   const ctx = chartCanvas.getContext("2d");
-  if (ctx) {
-    ctx.clearRect(0, 0, chartCanvas.width, chartCanvas.height);
-  }
+  if (ctx) ctx.clearRect(0, 0, chartCanvas.width, chartCanvas.height);
 }
 
 // ─────────────────────────────────────────────────────────────
-// BUG 2 FIX — EXTRACTOR_FN (inline function for executeScript)
+// EXTRACTOR_FN — inline function injected into the active tab
 // ─────────────────────────────────────────────────────────────
-// This is the FULL content-script logic passed as func: to
-// chrome.scripting.executeScript(). Because it's an inline
-// function (not a file path), Chrome ALWAYS re-evaluates it
-// on every scan — no tab-session caching possible.
-//
-// Keeping it here (in popup.js) means one fewer file to ship,
-// and the extraction logic stays in version-controlled sync
-// with the popup controller that consumes its output.
-//
-// NOTE: This function runs in the PAGE context, not the
-// extension context. It cannot access any popup.js variables.
-// It must be fully self-contained.
+// Passed as func: to executeScript() — NEVER cached by Chrome.
+// Fully self-contained (runs in page context, no popup vars).
+// BUG A FIX: priority-tiered DOM scraping + isVisible() guard.
+// BUG D FIX: sentenceIndex attached to every pair.
 
 const EXTRACTOR_FN = function () {
   "use strict";
 
-  // ── Noise blocklist (mirrors content.js NOISE_WORDS) ──────
+  // ── Noise blocklist ──────────────────────────────────────
   const CSS_UNITS    = ["px","em","rem","vh","vw","pt","pc","cm","mm","in","ex","ch","vmin","vmax","fr","deg","rad","turn","ms","hz","khz","dpi","dpcm","dppx"];
   const ORDINAL_SFXS = ["st","nd","rd","th"];
   const VERSION_PFXS = ["v","ver","rev","rc","beta","alpha","build"];
   const MEDIA_CODES  = ["mp3","mp4","jpg","jpeg","png","gif","svg","pdf","zip","gz","tar","wav","ogg","webm","mkv","avi","mov"];
   const HTML_TAGS    = ["h1","h2","h3","h4","h5","h6","p","br","hr","li","ul","ol","td","tr","th","div","span","img","src","alt","href"];
   const YEAR_CTXS    = ["year","yr","ad","bc","ce","bce"];
-
   const NOISE = new Set([
-    ...CSS_UNITS, ...ORDINAL_SFXS, ...VERSION_PFXS,
-    ...MEDIA_CODES, ...HTML_TAGS,
+    ...CSS_UNITS, ...ORDINAL_SFXS, ...VERSION_PFXS, ...MEDIA_CODES, ...HTML_TAGS,
     "px","id","ip","ui","ux","js","ts","py","go","rb","am","pm",
   ]);
 
@@ -150,50 +106,111 @@ const EXTRACTOR_FN = function () {
     return v >= 1900 && v <= 2099 && YEAR_CTXS.includes(ctx);
   }
 
-  // ── Gather raw text ──────────────────────────────────────
+  // ── BUG A FIX: isVisible guard ───────────────────────────
+  function isVisible(el) {
+    if (!el) return false;
+    const st = window.getComputedStyle(el);
+    return st.display !== "none" &&
+           st.visibility !== "hidden" &&
+           parseFloat(st.opacity) !== 0;
+  }
+
+  // ── BUG A FIX: extract text from NodeList, filter hidden ─
+  function extractText(nodeList) {
+    return Array.from(nodeList)
+      .filter(isVisible)
+      .map(el => (el.innerText || el.textContent || "").trim())
+      .filter(t => t.length > 0)
+      .join("\n");
+  }
+
+  // ── BUG A FIX: priority-tiered DOM scraping ──────────────
   let rawText = "";
+
+  // Tier 1: user selection
   const sel = window.getSelection();
   if (sel && sel.toString().trim().length > 0) {
     rawText = sel.toString();
-  } else {
-    const paras = document.querySelectorAll("p");
-    rawText = paras.length > 0
-      ? Array.from(paras).map(el => el.innerText || el.textContent || "").join("\n")
-      : (document.body.innerText || "");
   }
+  // Tier 2: <article> — blog/news/wiki
+  if (!rawText) {
+    const els = document.querySelectorAll("article");
+    if (els.length > 0) rawText = extractText(els);
+  }
+  // Tier 3: <main> — ARIA landmark
+  if (!rawText) {
+    const els = document.querySelectorAll("main");
+    if (els.length > 0) rawText = extractText(els);
+  }
+  // Tier 4: explicit multi-element set
+  if (!rawText) {
+    const els = document.querySelectorAll(
+      "p,li,td,th,h1,h2,h3,h4,h5,h6,blockquote,figcaption,caption,dt,dd"
+    );
+    if (els.length > 0) rawText = extractText(els);
+  }
+  // Tier 5: full body fallback
+  if (!rawText) rawText = document.body.innerText || "";
 
   rawText = rawText.replace(/[ \t]+/g, " ").trim();
 
-  // ── Regex + filtering ────────────────────────────────────
-  // BUG 2 FIX: `seen` Set removed — duplicate values kept so
-  // positional/proximity zipping in popup.js stays accurate.
+  // ── BUG D FIX: sentence splitting + charToSentence map ───
+  const sentences = [];
+  let cursor = 0;
+  for (const chunk of rawText.split(/[.!?\n]+/)) {
+    const trimmed = chunk.trim();
+    const actualStart = rawText.indexOf(trimmed, cursor);
+    if (trimmed.length > 0 && actualStart !== -1) {
+      sentences.push({ startOffset: actualStart, length: trimmed.length });
+      cursor = actualStart + trimmed.length;
+    } else {
+      cursor += chunk.length + 1;
+    }
+  }
+
+  // charToSentence[i] = index of sentence containing char i, or -1
+  const charToSentence = new Int16Array(rawText.length).fill(-1);
+  sentences.forEach((s, idx) => {
+    const end = Math.min(s.startOffset + s.length, rawText.length);
+    for (let i = s.startOffset; i < end; i++) charToSentence[i] = idx;
+  });
+
+  // ── Regex extraction ──────────────────────────────────────
   const PAIR_REGEX = /(\d[\d,]*\.?\d*)\s+([A-Za-z][A-Za-z0-9]{1,29})\b/g;
   const pairs = [];
   let match;
 
   while ((match = PAIR_REGEX.exec(rawText)) !== null) {
-    const rawMatch  = match[0].trim();
     const rawNumber = match[1];
     const context   = match[2].toLowerCase();
 
     // Noise filters
-    if (NOISE.has(context))                          continue;
-    if (context.length < 3)                          continue;
-    if (ORDINAL_SFXS.includes(context))              continue;
-    if ((context.match(/[a-z]/g)||[]).length < 2)    continue;
-    const _lc = (context.match(/[a-z]/g)||[]).length;
-    if (_lc / context.length < 0.7)                  continue; // blocks b2b, p2p, r2d2
+    if (NOISE.has(context))                              continue;
+    if (context.length < 3)                              continue;
+    if (ORDINAL_SFXS.includes(context))                  continue;
+    const lc = (context.match(/[a-z]/g) || []).length;
+    if (lc < 2 || lc / context.length < 0.7)            continue;
+    if (VERSION_PFXS.includes(context) &&
+        /^\d/.test(match[2].slice(1)))                   continue;
 
     const numericValue = parseFloat(rawNumber.replace(/,/g, ""));
-    if (isNaN(numericValue))                         continue;
-    if (isYearLike(numericValue, context))           continue;
-    if (numericValue <= 0)                           continue;
+    if (isNaN(numericValue) || numericValue <= 0)        continue;
+    if (isYearLike(numericValue, context))               continue;
+
+    // sentenceIndex: fall back to last sentence before this position
+    let sentIdx = charToSentence[match.index];
+    if (sentIdx === -1) {
+      for (let s = sentences.length - 1; s >= 0; s--) {
+        if (sentences[s].startOffset <= match.index) { sentIdx = s; break; }
+      }
+    }
 
     pairs.push({
-      value:       numericValue,
-      context:     context,
-      raw:         rawMatch,
-      sourceIndex: match.index,   // char offset — used for proximity zip
+      value:         numericValue,
+      context:       context,
+      raw:           match[0].trim(),
+      sourceIndex:   match.index,
+      sentenceIndex: sentIdx,
     });
   }
 
@@ -201,11 +218,94 @@ const EXTRACTOR_FN = function () {
   return pairs;
 };
 
-// ── STEP 1: Scan Page ─────────────────────────────────────────
-//
-// BUG 2 FIX: uses func: EXTRACTOR_FN instead of files:["content.js"]
-// so Chrome never caches the injection result.
+// ─────────────────────────────────────────────────────────────
+// BUG C FIX — Storage helpers
+// ─────────────────────────────────────────────────────────────
+// chrome.storage.session: survives popup close/reopen within
+// the same browser session. Wiped when browser closes.
+// All reads/writes are async — we await them carefully.
 
+const STORAGE_KEY = "datagrapherState";
+
+async function saveState(xLabel, yLabel, chartType) {
+  try {
+    await chrome.storage.session.set({
+      [STORAGE_KEY]: {
+        allPairs,
+        filteredDS,
+        xLabel,
+        yLabel,
+        chartType,
+      }
+    });
+  } catch (e) {
+    // Storage failure is non-fatal — user just loses restore on reopen
+    console.warn("DataGrapher: state save failed", e);
+  }
+}
+
+async function loadState() {
+  try {
+    const result = await chrome.storage.session.get(STORAGE_KEY);
+    return result[STORAGE_KEY] || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function clearState() {
+  try {
+    await chrome.storage.session.remove(STORAGE_KEY);
+  } catch (e) { /* non-fatal */ }
+}
+
+// ─────────────────────────────────────────────────────────────
+// BUG C FIX — Restore state on popup open
+// ─────────────────────────────────────────────────────────────
+// On every popup open, check storage. If previous session state
+// exists, silently rebuild the UI without requiring a re-scan.
+
+document.addEventListener("DOMContentLoaded", async () => {
+  const saved = await loadState();
+  if (!saved || !Array.isArray(saved.allPairs) || saved.allPairs.length === 0) {
+    return; // nothing to restore — fresh start
+  }
+
+  // Restore in-memory state
+  allPairs   = saved.allPairs;
+  filteredDS = saved.filteredDS || { labels: [], values: [], raws: [] };
+
+  // Rebuild dropdowns with saved pairs
+  populateDropdowns(allPairs, saved.xLabel, saved.yLabel);
+  emptyState.style.display = "none";
+
+  // Restore chart type radio
+  if (saved.chartType) {
+    const radio = document.querySelector(`input[name="chart-type"][value="${saved.chartType}"]`);
+    if (radio) radio.checked = true;
+  }
+
+  // Re-render chart + table if a chart was built
+  if (filteredDS.labels.length > 0 && saved.xLabel && saved.yLabel) {
+    buildChart(filteredDS, saved.chartType || "bar", saved.xLabel, saved.yLabel);
+    renderTable(filteredDS, saved.xLabel, saved.yLabel);
+    exportRow.style.display = "flex";
+    setStatus(
+      `Restored — ${allPairs.length} pair(s). Chart: X="${saved.xLabel}", Y="${saved.yLabel}".`,
+      "success"
+    );
+  } else {
+    setStatus(
+      `Restored ${allPairs.length} pair(s). Pick axes and click Build Chart.`,
+      "success"
+    );
+  }
+
+  buildBtn.disabled = false;
+  resetBtn.disabled = false;
+});
+
+// ── STEP 1: Scan Page ─────────────────────────────────────────
 scanBtn.addEventListener("click", async () => {
   setStatus("Scanning page…", "default", true);
   scanBtn.disabled = true;
@@ -214,10 +314,9 @@ scanBtn.addEventListener("click", async () => {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab || !tab.id) throw new Error("No active tab found.");
 
-    // ── BUG 2 FIX: inline func — always re-evaluated ─────────
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func:   EXTRACTOR_FN,       // ← inline, never cached
+      func:   EXTRACTOR_FN,
     });
 
     const pairs = results?.[0]?.result;
@@ -225,11 +324,14 @@ scanBtn.addEventListener("click", async () => {
     if (!Array.isArray(pairs) || pairs.length === 0) {
       throw new Error(
         "No numeric pairs found. Try selecting specific text first, " +
-        "or check that the page has visible numeric content in paragraphs."
+        "or check that the page has visible numeric content."
       );
     }
 
     allPairs = pairs;
+    filteredDS = { labels: [], values: [], raws: [] }; // clear old chart data
+    await clearState(); // wipe old storage so stale chart doesn't restore
+
     populateDropdowns(allPairs);
     emptyState.style.display = "none";
 
@@ -249,7 +351,9 @@ scanBtn.addEventListener("click", async () => {
 });
 
 // ── STEP 2: Populate Dropdowns ────────────────────────────────
-function populateDropdowns(pairs) {
+// BUG C FIX: accepts optional savedX/savedY to restore selections
+
+function populateDropdowns(pairs, savedX = null, savedY = null) {
   const contexts = uniqueContexts(pairs);
 
   xSelect.innerHTML = "";
@@ -258,7 +362,7 @@ function populateDropdowns(pairs) {
   const makePlaceholder = () => {
     const o = document.createElement("option");
     o.value = ""; o.textContent = "— Select —";
-    o.disabled = true; o.selected = true;
+    o.disabled = true;
     return o;
   };
 
@@ -266,7 +370,6 @@ function populateDropdowns(pairs) {
   ySelect.appendChild(makePlaceholder());
 
   contexts.forEach((ctx) => {
-    // Count how many pairs have this context — shown as "(n)" hint
     const count = pairs.filter(p => p.context === ctx).length;
     const makeOpt = () => {
       const o = document.createElement("option");
@@ -278,65 +381,57 @@ function populateDropdowns(pairs) {
     ySelect.appendChild(makeOpt());
   });
 
+  // BUG C FIX: restore saved selections if they exist in the new options
+  if (savedX && contexts.includes(savedX)) xSelect.value = savedX;
+  if (savedY && contexts.includes(savedY)) ySelect.value = savedY;
+
+  // If no saved value, ensure placeholder shows (no accidental selection)
+  if (!xSelect.value) xSelect.options[0].selected = true;
+  if (!ySelect.value) ySelect.options[0].selected = true;
+
   xSelect.disabled = false;
   ySelect.disabled = false;
 }
 
 // ── STEP 3: Build Chart ───────────────────────────────────────
-buildBtn.addEventListener("click", () => {
-  const xLabel = xSelect.value;
-  const yLabel = ySelect.value;
+buildBtn.addEventListener("click", async () => {
+  const xLabel    = xSelect.value;
+  const yLabel    = ySelect.value;
+  const chartType = getSelectedChartType();
 
-  if (!xLabel) { setStatus("Please select an X-axis label.", "error"); return; }
-  if (!yLabel) { setStatus("Please select a Y-axis label.", "error"); return; }
+  if (!xLabel)           { setStatus("Please select an X-axis label.", "error"); return; }
+  if (!yLabel)           { setStatus("Please select a Y-axis label.", "error"); return; }
   if (xLabel === yLabel) { setStatus("X and Y axes must be different.", "error"); return; }
 
   const { ds, warning } = filterDataset(allPairs, xLabel, yLabel);
   filteredDS = ds;
 
   if (filteredDS.labels.length === 0) {
-    setStatus(
-      `No pairable data found for "${xLabel}" ↔ "${yLabel}". ` +
-      `Try different axis selections.`,
-      "error"
-    );
+    setStatus(`No pairable data for "${xLabel}" ↔ "${yLabel}". Try different axes.`, "error");
     return;
   }
 
-  const chartType = getSelectedChartType();
   buildChart(filteredDS, chartType, xLabel, yLabel);
   renderTable(filteredDS, xLabel, yLabel);
   exportRow.style.display = "flex";
+
+  // BUG C FIX: persist state immediately after chart builds
+  await saveState(xLabel, yLabel, chartType);
 
   const msg = `Chart built — ${filteredDS.labels.length} point(s). X="${xLabel}", Y="${yLabel}".`;
   setStatus(warning ? `${msg} ⚠ ${warning}` : msg, warning ? "error" : "success");
 });
 
 // ─────────────────────────────────────────────────────────────
-// BUG 4 FIX — filterDataset() with proximity-based matching
+// BUG D FIX — filterDataset() with sentence-aware two-pass matching
 // ─────────────────────────────────────────────────────────────
-// OLD approach: simple positional zip — pairs X[0]↔Y[0],
-//   X[1]↔Y[1] regardless of where they appear in the text.
-//   BROKE when: X and Y counts differed, or content.js `seen`
-//   Set silently dropped pairs making counts unequal.
-//
-// NEW approach — proximity matching:
-//   For each X-pair (sorted by sourceIndex), find the Y-pair
-//   whose sourceIndex is CLOSEST (smallest absolute distance)
-//   and that hasn't been claimed yet. This maps data that
-//   naturally appears near each other in text, regardless of
-//   whether counts match.
-//
-//   Example: "Revenue 500 dollars in month 1. Month 2 saw 800 dollars."
-//     X-pairs (month):   [{val:1,idx:35}, {val:2,idx:52}]
-//     Y-pairs (dollars): [{val:500,idx:12}, {val:800,idx:62}]
-//   Proximity:
-//     month@35 → closest unclaimed dollars@12 (dist=23) ✓ → (1, 500)
-//     month@52 → closest unclaimed dollars@62 (dist=10) ✓ → (2, 800)
-//   Result: correct pairing even though dollars appears BEFORE month.
-//
-// Falls back to positional zip if proximity produces 0 pairs
-// (safety net for unusual page structures).
+// Pass 1: match X and Y pairs that share the same sentenceIndex.
+//         This is the primary pairing strategy — data in the same
+//         sentence almost always belongs together.
+// Pass 2: any X-pairs that found no same-sentence Y fall back to
+//         global proximity search across remaining unclaimed Y-pairs.
+//         This handles pages where data spans multiple sentences
+//         but is still logically related (e.g. tables, bullet lists).
 
 function filterDataset(pairs, xLabel, yLabel) {
   const xPairs = pairs
@@ -347,64 +442,95 @@ function filterDataset(pairs, xLabel, yLabel) {
     .filter(p => p.context === yLabel)
     .sort((a, b) => a.sourceIndex - b.sourceIndex);
 
-  if (xPairs.length === 0 || yPairs.length === 0) {
+  if (!xPairs.length || !yPairs.length) {
     return { ds: { labels: [], values: [], raws: [] }, warning: null };
   }
 
-  // ── Proximity matching ─────────────────────────────────────
-  const claimedY = new Set(); // indices into yPairs that are taken
-  const labels = [], values = [], raws = [];
+  const claimedY  = new Set();
+  const labels    = [];
+  const values    = [];
+  const raws      = [];
+  const unpairedX = []; // X-pairs that found no same-sentence Y
 
+  // ── Pass 1: same-sentence matching ────────────────────────
   for (const xp of xPairs) {
     let bestIdx  = -1;
     let bestDist = Infinity;
 
     for (let j = 0; j < yPairs.length; j++) {
       if (claimedY.has(j)) continue;
+
+      // BUG D FIX: only consider Y-pairs in the same sentence
+      const sameSentence = xp.sentenceIndex !== -1 &&
+                           yPairs[j].sentenceIndex !== -1 &&
+                           xp.sentenceIndex === yPairs[j].sentenceIndex;
+      if (!sameSentence) continue;
+
       const dist = Math.abs(xp.sourceIndex - yPairs[j].sourceIndex);
-      if (dist < bestDist) {
-        bestDist = dist;
-        bestIdx  = j;
-      }
+      if (dist < bestDist) { bestDist = dist; bestIdx = j; }
     }
 
-    if (bestIdx === -1) continue; // no unclaimed Y-pair for this X — skip, keep going
-
-    claimedY.add(bestIdx);
-    labels.push(xp.value);
-    values.push(yPairs[bestIdx].value);
-    raws.push(`${xp.raw}  ←→  ${yPairs[bestIdx].raw}`);
-  }
-
-  // ── Fallback: positional zip ───────────────────────────────
-  // Triggered if proximity matching somehow produced 0 results
-  // (e.g. all sourceIndex values are identical — unlikely but safe).
-  if (labels.length === 0) {
-    const len = Math.min(xPairs.length, yPairs.length);
-    for (let i = 0; i < len; i++) {
-      labels.push(xPairs[i].value);
-      values.push(yPairs[i].value);
-      raws.push(`${xPairs[i].raw}  ←→  ${yPairs[i].raw}`);
+    if (bestIdx !== -1) {
+      claimedY.add(bestIdx);
+      labels.push(xp.value);
+      values.push(yPairs[bestIdx].value);
+      raws.push(`${xp.raw}  ←→  ${yPairs[bestIdx].raw}`);
+    } else {
+      unpairedX.push(xp); // defer to Pass 2
     }
   }
 
-  // ── Unmatched pair warning ─────────────────────────────────
-  const unmatched = xPairs.length - labels.length;
-  const warning = unmatched > 0
-    ? `${unmatched} X-value(s) had no matching Y-value and were skipped.`
-    : null;
+  // ── Pass 2: global proximity fallback for unmatched X ─────
+  for (const xp of unpairedX) {
+    let bestIdx  = -1;
+    let bestDist = Infinity;
 
-  return { ds: { labels, values, raws }, warning };
+    for (let j = 0; j < yPairs.length; j++) {
+      if (claimedY.has(j)) continue;
+      const dist = Math.abs(xp.sourceIndex - yPairs[j].sourceIndex);
+      if (dist < bestDist) { bestDist = dist; bestIdx = j; }
+    }
+
+    if (bestIdx !== -1) {
+      claimedY.add(bestIdx);
+      labels.push(xp.value);
+      values.push(yPairs[bestIdx].value);
+      raws.push(`${xp.raw}  ←→  ${yPairs[bestIdx].raw}  [cross-sentence]`);
+    }
+    // If still no match: simply not included (already handled by continue)
+  }
+
+  // Sort final pairs by the original X sourceIndex so chart reads L→R
+  const combined = labels.map((l, i) => ({ l, v: values[i], r: raws[i] }));
+  combined.sort((a, b) => {
+    const ax = xPairs.find(p => p.value === a.l)?.sourceIndex ?? 0;
+    const bx = xPairs.find(p => p.value === b.l)?.sourceIndex ?? 0;
+    return ax - bx;
+  });
+
+  const unmatched = xPairs.length - combined.length;
+  return {
+    ds: {
+      labels: combined.map(c => c.l),
+      values: combined.map(c => c.v),
+      raws:   combined.map(c => c.r),
+    },
+    warning: unmatched > 0
+      ? `${unmatched} X-value(s) had no Y match and were skipped.`
+      : null,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
-// BUG 1 FIX — buildChart() using destroyChart()
+// BUG B FIX — buildChart() with animation: 0 + rAF export
 // ─────────────────────────────────────────────────────────────
+// Animation duration set to 0: no partial-frame capture risk.
+// toDataURL() is now wrapped in requestAnimationFrame (see
+// exportPNG handler below) to guarantee a full browser paint
+// cycle before pixel read.
 
 function buildChart(ds, type, xLabel, yLabel) {
-  // BUG 1 FIX: three-layer canvas cleanup before new Chart()
   destroyChart();
-
   chartWrapper.classList.add("visible");
 
   const PALETTE = [
@@ -413,29 +539,29 @@ function buildChart(ds, type, xLabel, yLabel) {
     "#f472b6","#38bdf8","#e879f9","#facc15",
   ];
 
-  const bgColors     = ds.labels.map((_, i) => PALETTE[i % PALETTE.length]);
-  const borderColors = bgColors.slice();
+  const bgColors = ds.labels.map((_, i) => PALETTE[i % PALETTE.length]);
 
   const config = {
-    type: type,
+    type,
     data: {
       labels: ds.labels.map(String),
       datasets: [{
-        label:              yLabel,
-        data:               ds.values,
-        backgroundColor:    type === "pie" ? bgColors  : "rgba(108, 99, 255, 0.65)",
-        borderColor:        type === "pie" ? borderColors : "#6c63ff",
-        borderWidth:        2,
-        tension:            0.35,
-        pointBackgroundColor: "#6c63ff",
-        pointRadius:        4,
-        fill:               type === "line",
+        label:               yLabel,
+        data:                ds.values,
+        backgroundColor:     type === "pie" ? bgColors : "rgba(108, 99, 255, 0.65)",
+        borderColor:         type === "pie" ? bgColors : "#6c63ff",
+        borderWidth:         2,
+        tension:             0.35,
+        pointBackgroundColor:"#6c63ff",
+        pointRadius:         4,
+        fill:                type === "line",
       }],
     },
     options: {
       responsive:          true,
       maintainAspectRatio: true,
-      animation:           { duration: 350 },
+      // BUG B FIX: animation off — no mid-frame toDataURL() race
+      animation:           { duration: 0 },
       plugins: {
         legend: {
           display: type === "pie",
@@ -464,7 +590,6 @@ function buildChart(ds, type, xLabel, yLabel) {
     },
   };
 
-  // BUG 1 FIX: store fresh instance; canvas is guaranteed clean
   chartInst = new Chart(chartCanvas, config);
 }
 
@@ -475,18 +600,16 @@ function renderTable(ds, xLabel, yLabel) {
   tableBody.innerHTML = "";
 
   ds.labels.forEach((lbl, i) => {
-    const tr   = document.createElement("tr");
-    const tdX  = document.createElement("td");
-    const tdY  = document.createElement("td");
-    const tdRw = document.createElement("td");
-
-    tdX.textContent  = lbl;
-    tdY.textContent  = ds.values[i];
-    tdRw.textContent = ds.raws[i];
-
+    const tr  = document.createElement("tr");
+    const tdX = document.createElement("td");
+    const tdY = document.createElement("td");
+    const tdR = document.createElement("td");
+    tdX.textContent = lbl;
+    tdY.textContent = ds.values[i];
+    tdR.textContent = ds.raws[i];
     tr.appendChild(tdX);
     tr.appendChild(tdY);
-    tr.appendChild(tdRw);
+    tr.appendChild(tdR);
     tableBody.appendChild(tr);
   });
 
@@ -494,10 +617,27 @@ function renderTable(ds, xLabel, yLabel) {
   tableWrapper.classList.add("visible");
 }
 
-// ── Export: PNG ───────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// BUG B FIX — exportPNG with requestAnimationFrame guard
+// ─────────────────────────────────────────────────────────────
+// Even with animation:0, the canvas may not have flushed its
+// GPU draw buffer to the CPU-readable pixel array within the
+// same JS microtask. requestAnimationFrame defers the read to
+// AFTER the browser has completed one full composite + paint
+// cycle, guaranteeing a fully rendered frame in toDataURL().
+
 exportPNG.addEventListener("click", () => {
   if (!chartInst) return;
-  triggerDownload(chartCanvas.toDataURL("image/png"), "datagraph-chart.png");
+
+  requestAnimationFrame(() => {
+    // Second rAF: ensures we're past the composite step on all GPUs.
+    // One rAF fires at the START of the next frame; two rAFs guarantees
+    // the frame has been COMMITTED to the display pipeline.
+    requestAnimationFrame(() => {
+      const url = chartCanvas.toDataURL("image/png");
+      triggerDownload(url, "datagraph-chart.png");
+    });
+  });
 });
 
 // ── Export: CSV ───────────────────────────────────────────────
@@ -511,8 +651,6 @@ exportCSV.addEventListener("click", () => {
     `"${xL}","${yL}","raw_match"`,
     ...filteredDS.labels.map(
       (lbl, i) =>
-        // BUG 4 FIX: escape any double-quotes inside raw strings
-        // so the CSV doesn't break in Excel/LibreOffice.
         `${lbl},${filteredDS.values[i]},"${String(filteredDS.raws[i]).replace(/"/g, '""')}"`
     ),
   ];
@@ -525,21 +663,21 @@ exportCSV.addEventListener("click", () => {
 
 // ── triggerDownload ───────────────────────────────────────────
 function triggerDownload(url, filename) {
-  const a      = document.createElement("a");
-  a.href       = url;
-  a.download   = filename;
-  a.style.display = "none";
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.style.display = "none";
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
 }
 
 // ── Reset ─────────────────────────────────────────────────────
-resetBtn.addEventListener("click", () => {
-  destroyChart(); // BUG 1 FIX: use safe destroy, not inline logic
-
+resetBtn.addEventListener("click", async () => {
+  destroyChart();
   allPairs   = [];
   filteredDS = { labels: [], values: [], raws: [] };
+
+  // BUG C FIX: clear persisted state on explicit reset
+  await clearState();
 
   xSelect.innerHTML = '<option value="">— Scan first —</option>';
   ySelect.innerHTML = '<option value="">— Scan first —</option>';
@@ -549,10 +687,8 @@ resetBtn.addEventListener("click", () => {
   tableBody.innerHTML = "";
   tableWrapper.classList.remove("visible");
   pairCount.textContent = "0 pairs";
-
   chartWrapper.classList.remove("visible");
   exportRow.style.display = "none";
-
   emptyState.style.display = "block";
 
   buildBtn.disabled = true;
@@ -562,23 +698,22 @@ resetBtn.addEventListener("click", () => {
   setStatus('Click "Scan Page" to extract data from the active tab.');
 });
 
-// ── Chart type radio — instant redraw ─────────────────────────
+// ── Chart type radio — instant redraw + state save ────────────
 document.querySelectorAll('input[name="chart-type"]').forEach((radio) => {
-  radio.addEventListener("change", () => {
+  radio.addEventListener("change", async () => {
     if (filteredDS.labels.length > 0) {
       buildChart(filteredDS, radio.value, xSelect.value, ySelect.value);
+      // BUG C FIX: save updated chart type preference
+      await saveState(xSelect.value, ySelect.value, radio.value);
     }
   });
 });
 
 // ── Utilities ─────────────────────────────────────────────────
-
-/** Returns sorted unique context words from a pairs array */
 function uniqueContexts(pairs) {
   return [...new Set(pairs.map(p => p.context))].sort();
 }
 
-/** Returns the currently selected chart type */
 function getSelectedChartType() {
   return document.querySelector('input[name="chart-type"]:checked')?.value || "bar";
 }

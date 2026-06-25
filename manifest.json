@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DataGrapher — Smart Data Extractor",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Extract numeric data from any webpage and visualise it as Bar, Line, or Pie charts — fully offline.",
   "icons": {
     "16":  "icons/icon16.png",
@@ -10,7 +10,8 @@
   },
   "permissions": [
     "activeTab",
-    "scripting"
+    "scripting",
+    "storage"
   ],
   "action": {
     "default_popup": "popup.html",
