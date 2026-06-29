@@ -191,6 +191,7 @@ No `host_permissions`, no `tabs` (broad), no `storage`, no network access.
 - **Year filtering** is not automatic. If "2024" and "2023" appear as a context word "year", they'll show up in the dropdown — simply don't select "year" as an axis.
 - **Tables (`<table>`)** are not scraped by default. To add table support, append `Array.from(document.querySelectorAll("td"))` to the source list in `content.js`.
 - **Shadow DOM** content (many SPAs) is not accessible from `document.querySelectorAll`. Use text selection on visible text instead.
+- **Shadow DOM** FURTHER NEW VERSION WILL FIX ALL OF THE BUGS AND THE LIMITATIONS.
 
 ---
 
